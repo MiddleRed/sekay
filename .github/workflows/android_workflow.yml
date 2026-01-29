@@ -1,0 +1,125 @@
+name: Android Package Workflow
+on:
+  repository_dispatch:
+    types: [android-fetch]
+  
+  workflow_dispatch:
+    inputs:
+      app_version_code:
+        description: 'App Version Code'
+        required: false
+        type: string
+      run_analyze:
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  uni_env:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version_code: ${{ steps.combiner.outputs.app_version_code }}
+      run_analyze: ${{ steps.combiner.outputs.run_analyze }}
+    steps:
+      - id: combiner
+        run: |
+          VERSION="${{ github.event.inputs.app_version_code || github.event.client_payload.app_version_code }}"
+          ANALYZE="${{ github.event.inputs.run_analyze || github.event.client_payload.run_analyze }}"
+  
+          if [ -z "$ANALYZE" ]; then ANALYZE="true"; fi
+
+          echo "app_version_code=$VERSION" >> $GITHUB_OUTPUT
+          echo "run_analyze=$ANALYZE" >> $GITHUB_OUTPUT
+
+  get-package:
+    needs: uni_env
+    permissions:
+      contents: write
+    uses: ./.github/workflows/apkpure.yml
+    with:
+      app_version_code: ${{ needs.uni_env.outputs.app_version_code }}
+      to_apk: true
+      update_version: true
+  
+  inital-analysis:
+    needs: [uni_env, get-package]
+    if: |
+      needs.uni_env.outputs.run_analyze == 'true' && 
+      needs.get-package.outputs.flow_skip != 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/analyze.yml
+    secrets: inherit
+    with:
+      artifact_name: application.apk
+      binary_name: libil2cpp.so
+  
+  il2cpp-dumper:
+    needs: [uni_env, inital-analysis]
+    if: needs.uni_env.outputs.run_analyze == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/il2cppdumper.yml
+    secrets: inherit
+    with:
+      artifact_name: initial_analysis
+      binary_name: libil2cpp.so
+  
+  analysis-release:
+    runs-on: ubuntu-latest
+    needs: [uni_env, get-package, inital-analysis, il2cpp-dumper]
+    permissions:
+      contents: write
+    
+    steps:  
+      - name: Download xapk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application.xapk
+          path: release
+      
+      - name: Download apk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application.apk
+          path: release
+      
+      - name: Download initial analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: initial_analysis
+          path: initial_analysis
+      
+      - name: Download il2cpp analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: il2cpp_analysis
+          path: il2cpp_analysis
+
+      - name: Prepare for release
+        env:
+          APP_VERSION: ${{ needs.get-package.outputs.app_version }}
+        run: |
+          PLATFORM="android"
+          TITLE="Android"
+
+          VERSION=$APP_VERSION
+          RELEASE_TAG="v${VERSION}_${PLATFORM}"
+          RELEASE_TITLE="${VERSION} ${TITLE}"
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$RELEASE_TITLE" >> $GITHUB_ENV
+
+          (cd initial_analysis && zip -r ../release/initial_analysis.zip .)
+          (cd il2cpp_analysis && zip -r ../release/il2cpp_analysis.zip .)
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_TITLE }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: release/*  
+
+          overwrite_files: true
+          make_latest: false
+          fail_on_unmatched_files: false

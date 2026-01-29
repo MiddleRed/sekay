@@ -1,0 +1,122 @@
+name: XAPK to APK
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+      xapk_name:
+        required: true
+        type: string
+
+jobs:
+  to_apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: artifact
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install System Dependencies
+        run: |
+          # ubuntu-latest already includes them
+          # sudo apt-get update
+          # sudo apt-get install -y p7zip-full
+          
+          wget https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O apktool
+          wget https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+
+          chmod +x apktool
+          sudo mv apktool /usr/local/bin/
+          sudo mv apktool.jar /usr/local/bin/
+
+      - name: Setup Android Tools
+        run: |
+          BUILD_TOOLS_DIR=$(find $ANDROID_HOME/build-tools -maxdepth 1 -type d | sort -V | tail -n 1)
+          echo "$BUILD_TOOLS_DIR" >> $GITHUB_PATH
+
+      - name: Checkout Converter Tool
+        uses: actions/checkout@v4
+        with:
+          repository: LuigiVampa92/xapk-to-apk
+          path: xapk-tool-repo
+          ref: 4b34f1728815b00c04d2e8170b5728513e8a09cf  # pinned
+
+      - name: Convert XAPK to APK
+        env:
+          XAPK_NAME: ${{ inputs.xapk_name }}
+        run: |
+          echo "Running conversion..."
+
+          mv ./artifact/$XAPK_NAME ./$XAPK_NAME
+
+          python3 xapk-tool-repo/xapktoapk.py $XAPK_NAME
+          APK_NAME="${XAPK_NAME%.xapk}.apk"
+
+          mv $APK_NAME temp_merged.apk
+
+      - name: Modify Manifest Attributes
+        env:
+          XAPK_NAME: ${{ inputs.xapk_name }}
+        run: |
+          echo "Decompiling..."
+          apktool d -f -r -s temp_merged.apk -o build_dir
+          
+          cd build_dir
+          echo "Patching AndroidManifest.xml..."
+          
+          # remove:
+          # android:isSplitRequired="true"
+          # android:requiredSplitTypes="base__abi"
+          # android:extractNativeLibs="true"
+          sed -i -E 's/android:isSplitRequired="[^"]*"//g' AndroidManifest.xml
+          sed -i -E 's/android:requiredSplitTypes="[^"]*"//g' AndroidManifest.xml
+          sed -i -E 's/android:extractNativeLibs="[^"]*"//g' AndroidManifest.xml
+          
+          grep "application" AndroidManifest.xml || true
+          
+          cd ..
+          
+          echo "Rebuilding..."
+
+          UNSIGNED_APK_NAME="${XAPK_NAME%.xapk}-unsigned.apk"
+          apktool b build_dir -o $UNSIGNED_APK_NAME
+
+      - name: Sign APK
+        env:
+          XAPK_NAME: ${{ inputs.xapk_name }}
+        id: final
+        run: |
+          keytool -genkey -v -keystore debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          UNSIGNED_APK_NAME="${XAPK_NAME%.xapk}-unsigned.apk"
+          APK_NAME="${XAPK_NAME%.xapk}.apk"
+
+          apksigner sign --ks debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --out $APK_NAME $UNSIGNED_APK_NAME
+          
+          echo "final_name=${APK_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application.apk
+          path: ${{ steps.final.outputs.final_name }}

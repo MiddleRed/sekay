@@ -1,0 +1,264 @@
+name: Fetch XAPK Package
+on:
+  workflow_dispatch:
+    inputs:
+      app_version_code:
+        description: 'App Version Code'
+        required: false
+        type: string
+      to_apk:
+        required: true
+        default: true
+        type: boolean
+      update_version:
+        required: false
+        default: false
+        type: boolean
+
+
+  workflow_call:
+    inputs:
+      app_version_code:
+        description: 'App Version Code'
+        required: false
+        type: string
+      to_apk:
+        required: true
+        default: true
+        type: boolean
+      update_version:
+        required: false
+        default: false
+        type: boolean
+
+    outputs:
+      flow_skip:
+        value: ${{ jobs.download.outputs.flow_skip }}
+      app_version:
+        value: ${{ jobs.download.outputs.app_version }}
+  
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:  
+          fetch-depth: 1
+          path: work_repo
+      
+      - name: Fetch Lastest XAPK
+        if: inputs.app_version_code == ''
+        run: |
+          echo "XAPK_FILE_EXIST=false" >> "$GITHUB_ENV"
+          
+          # wget https://d.apkpure.net/b/XAPK/com.sega.pjsekai?version=latest -O application.xapk
+          aria2c -x16 -s16 -k1M \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            "https://d.apkpure.net/b/XAPK/com.sega.pjsekai?version=latest" \
+            -o application.xapk
+
+          unzip application.xapk manifest.json
+
+          #!/bin/bash
+
+          # Define file paths
+          VERSION_FILE="./work_repo/android_version"
+          HISTORY_FILE="./work_repo/android_history.json"
+
+          # Extract latest version info from manifest.json
+          LATEST_VERSION_NAME=$(jq -r '.version_name' manifest.json)
+          LATEST_VERSION_CODE=$(jq -r '.version_code' manifest.json)
+
+          # Read current local version (returns empty if file doesn't exist)
+          LOCAL_CURRENT_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
+          
+          # Compare versions
+          if [ "$LOCAL_CURRENT_VERSION" != "$LATEST_VERSION_NAME" ]; then
+            echo "New version detected: $LATEST_VERSION_NAME"
+
+            # Update the local version file
+            echo "$LATEST_VERSION_NAME" > "$VERSION_FILE"
+
+            # Prepend the new record to the top of the JSON object
+            # {New Record} * {Old Records} -> New record appears first
+            tmp_json=$(jq --arg name "$LATEST_VERSION_NAME" \
+                          --arg code "$LATEST_VERSION_CODE" \
+                          '({($name): {"version": $name, "versionCode": $code}}) * .' \
+                          "$HISTORY_FILE")
+
+            # Save the updated JSON back to the file
+            echo "$tmp_json" > "$HISTORY_FILE"
+            echo "Update complete. New record prepended to $HISTORY_FILE."
+            echo "XAPK_FILE_EXIST=true" >> "$GITHUB_ENV"
+
+            XAPK_NAME=${LATEST_VERSION_NAME}.xapk
+            mv application.xapk $XAPK_NAME
+            echo "XAPK_NAME=$XAPK_NAME" >> "$GITHUB_ENV"
+
+            # Prepare version change commit
+            echo "VERSION_UPDATED=true" >> "$GITHUB_ENV"
+
+            COMMIT_MESSAGE="Update Android version to $LATEST_VERSION_NAME"
+            echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> "$GITHUB_ENV"
+          else
+            echo "Version is up to date. Skipping update."
+          fi
+
+          echo "app_version=$LATEST_VERSION_NAME" >> $GITHUB_ENV
+      
+      - name: Fetch Specific XAPK
+        if: inputs.app_version_code != ''
+        env:
+          VERSION_CODE: ${{ inputs.app_version_code }}
+        run: |
+          echo "XAPK_FILE_EXIST=false" >> "$GITHUB_ENV"
+          
+          URL="https://d.apkpure.net/b/XAPK/com.sega.pjsekai?versionCode=$VERSION_CODE"
+          echo Target version url: $URL
+          # wget $URL -O application.xapk
+          
+          RESULT=$(curl -IsL -w "%{http_code} %{content_type}" "$URL" -o /dev/null)
+
+          STATUS_CODE=$(echo $RESULT | cut -d' ' -f1)
+          CONTENT_TYPE=$(echo $RESULT | cut -d' ' -f2)
+
+          if [ "$STATUS_CODE" -ne 200 ]; then
+              echo Invalid Url: $STATUS_CODE
+              exit 1
+          fi
+
+          aria2c -x16 -s16 -k1M \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" $URL \
+            -o application.xapk
+
+          unzip application.xapk manifest.json
+
+          # Extract version info from manifest.json
+          VERSION_NAME=$(jq -r '.version_name' manifest.json)
+          VERSION_CODE=$(jq -r '.version_code' manifest.json)
+          
+          echo VERSION_CODE: $VERSION_CODE
+          echo VERSION_NAME: $VERSION_NAME
+
+          XAPK_NAME=${VERSION_NAME}.xapk
+          mv application.xapk $XAPK_NAME
+          echo "XAPK_NAME=$XAPK_NAME" >> "$GITHUB_ENV"
+
+          echo "XAPK_FILE_EXIST=true" >> "$GITHUB_ENV"
+          echo "app_version=$VERSION_NAME" >> $GITHUB_ENV
+
+      - name: Upload Artifact        
+        if: env.XAPK_FILE_EXIST == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: application.xapk
+          path: ${{ env.XAPK_NAME }}
+      
+      - name: Call to skip if no Artifact
+        if: env.XAPK_FILE_EXIST != 'true'
+        run: echo "flow_skip=true" >> $GITHUB_ENV
+
+      - name: Commit new version changes
+        if: inputs.update_version && env.VERSION_UPDATED == 'true'
+        uses: iarekylew00t/verified-bot-commit@v2
+        with:
+          workspace: work_repo
+          message: ${{ env.COMMIT_MESSAGE }}
+          files: |
+            android_version
+            android_history.json
+            
+    outputs:
+      XAPK_FILE_EXIST: ${{ env.XAPK_FILE_EXIST }}
+      XAPK_NAME: ${{ env.XAPK_NAME }}
+      VERSION_UPDATE: ${{ env.VERSION_UPDATED }}
+      flow_skip: ${{ env.flow_skip }}
+      app_version: ${{ env.app_version }}
+
+  merge_apk:
+    permissions:
+      contents: write
+
+    needs: download
+    if: inputs.to_apk && needs.download.outputs.XAPK_FILE_EXIST == 'true'
+    uses: ./.github/workflows/xapk2apk.yml
+    with:
+      artifact_name: application.xapk
+      xapk_name: ${{ needs.download.outputs.XAPK_NAME }}
+  
+  initial_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    needs: [download, merge_apk]
+    if: |
+      always() &&
+      inputs.update_version &&
+      needs.download.outputs.VERSION_UPDATE == 'true' &&
+      needs.download.result == 'success' &&
+      (needs.merge_apk.result == 'success' || needs.merge_apk.result == 'skipped')
+    steps:
+      # - name: Checkout
+      #   uses: actions/checkout@v4
+      #   with:  
+      #     fetch-depth: 1
+      #     ref: main
+      #     path: work_repo
+  
+      - name: Download xapk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application.xapk
+          path: artifact
+      
+      - name: Download apk artifact
+        if: inputs.to_apk
+        uses: actions/download-artifact@v4
+        with:
+          name: application.apk
+          path: artifact
+      
+      - name: Prepare for release
+        env:
+          VERSION: ${{ needs.download.outputs.app_version }}
+        run: |
+          cd ./artifact
+
+          PLATFORM="unknown"
+          TITLE="Unknown"
+
+          if [ -n "$(find . -maxdepth 2 \( -name "*.apk" -o -name "*.xapk" \) -print -quit)" ]; then
+              PLATFORM="android"
+              TITLE="Android"
+          elif [ -n "$(find . -maxdepth 2 -name "*.ipa" -print -quit)" ]; then
+              PLATFORM="ios"
+              TITLE="iOS"
+          fi
+
+          # VERSION=$(cat android_version 2>/dev/null)
+          RELEASE_TAG="v${VERSION}_${PLATFORM}"
+          RELEASE_TITLE="${VERSION} ${TITLE}"
+
+          # echo "test" > release_notes.md
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$RELEASE_TITLE" >> $GITHUB_ENV
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_TITLE }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: artifact/*  
+
+          overwrite_files: true
+          make_latest: false
+          fail_on_unmatched_files: false
+          # body_path: ./work_repo/release_notes.md

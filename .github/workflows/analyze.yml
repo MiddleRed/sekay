@@ -1,0 +1,98 @@
+name: Analyze
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+      binary_name:
+        required: true
+        type: string
+      
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:  
+          fetch-depth: 1
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: artifact
+
+      - name: Collect info
+        run: |
+          mkdir -p /tmp/package
+          mkdir -p /home/runner/release
+
+          cd artifact
+          cp -r . /tmp/package
+          ls /tmp/package
+
+          APP_PACKAGE=$(find . -type f \( -name "*.ipa" -o -name "*.apk" \) | head -n 1)
+          VERSION=$(echo $APP_PACKAGE | grep -oE "[0-9]+\.[0-9]+\.[0-9]+")
+
+          cp $APP_PACKAGE /home/runner/release/
+
+          echo "APP_PACKAGE=$APP_PACKAGE, VERSION=$VERSION"
+          
+          echo "APP_PACKAGE=$APP_PACKAGE" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+    
+      - name: Setup
+        env:
+          APP_PACKAGE: ${{ env.APP_PACKAGE }}
+          BINARY_NAME: ${{ inputs.binary_name }}
+        run: |
+          cd /tmp/package
+
+          7z x $APP_PACKAGE -o./package
+          BINARY_PATH=$(find ./package -name "$BINARY_NAME" -print -quit)
+          METADATA=$(find ./package -name "global-metadata.dat" -print -quit)
+          
+          echo "Target binary: $BINARY_PATH"
+          echo "global-metadata.dat path: $METADATA"
+          
+          echo "METADATA=$METADATA" >> $GITHUB_ENV
+
+          mkdir -p /home/runner/workspace
+          cp $BINARY_PATH /home/runner/workspace/
+          cp $METADATA /home/runner/workspace/.
+
+          
+      - name: Analyze
+        env:
+          BINARY_NAME: ${{ inputs.binary_name }}
+          IMAGE_URL: ${{ secrets.IMAGE_URL }}
+        run: |
+          # echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          echo "::add-mask::$IMAGE_URL"
+
+          echo "Pulling docker..."
+          docker pull -q $IMAGE_URL
+          echo "Pulling Finished"
+
+          docker run -d --name idap --network none \
+            -v /home/runner/workspace:/home/workspace \
+            -w /opt/ida $IMAGE_URL \
+            tail -f /dev/null
+          
+          docker exec idap ./idat -B -L"/dev/stdout" /home/workspace/$BINARY_NAME | tee /home/runner/workspace/output.log
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: initial_analysis
+          path: /home/runner/workspace
+      

@@ -1,0 +1,136 @@
+name: Il2cppDumper Automation
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+        default: "inital_analysis"
+      binary_name:
+        required: true
+        type: string
+  
+  workflow_call:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+        default: "inital_analysis"
+      binary_name:
+        required: true
+        type: string
+      
+
+jobs:
+  dumper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # Build Il2cppDumper on linux
+      - name: Checkout Il2cppDumper
+        uses: actions/checkout@v4
+        with:
+          repository: 'Perfare/Il2CppDumper'
+          path: 'il2cppdumper_repo'
+          fetch-depth: 1
+
+      - name: Setup .NET for build
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Dumper
+        run: |
+          cd il2cppdumper_repo
+          dotnet publish Il2CppDumper/Il2CppDumper.csproj \
+            -c Release \
+            -f net8.0 \
+            -r linux-x64 \
+            --self-contained false \
+            -o ../build_linux
+          
+          cd ..
+          chmod +x ./build_linux/Il2CppDumper
+          ./build_linux/Il2CppDumper
+    
+      - name: Checkout Scripts
+        uses: actions/checkout@v4
+        with:
+          path: 'work_repo'
+          fetch-depth: 1
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: initial_analysis
+      
+      # - name: Use GitHub Release
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     mkdir initial_analysis
+      #     cd initial_analysis
+      #     gh release download --repo "ExHix/maction" --pattern "*"
+      #     unzip analysis.zip
+
+      #     pwd
+      #     ls
+
+      #     7z x 6.2.1.ipa -o./package
+      #     METADATA=$(find ./package -name "global-metadata.dat" -print -quit)
+      #     echo "global-metadata.dat path: $METADATA"
+      #     cp $METADATA .
+
+      #     ls
+          
+      - name: Setup
+        env:
+          BINARY_NAME: ${{ inputs.binary_name }}
+        run: |
+          echo "[Step 1] Running python script"
+
+          pip3 install lief capstone
+          python3 work_repo/scripts/xor_dump.py initial_analysis/$BINARY_NAME initial_analysis/global-metadata.dat
+          sed -i 's/"RequireAnyKey": true/"RequireAnyKey": false/g' ./build_linux/config.json
+
+          echo "[Step 2] Running Il2cppDumper"
+
+          mkdir ./initial_analysis/dump
+          ./build_linux/Il2CppDumper  ./initial_analysis/global-metadata.dat.decrypted ./initial_analysis/$BINARY_NAME ./initial_analysis/dump
+
+          mv initial_analysis analysis
+          cp ./work_repo/scripts/ida_with_struct_py3_cli.py ./analysis/dump/
+      
+      - name: Analyze
+        env:
+          BINARY_NAME: ${{ inputs.binary_name }}
+          IMAGE_URL: ${{ secrets.IMAGE_URL }}
+        run: | 
+          echo "::add-mask::$IMAGE_URL"
+
+          echo "Pulling docker..."
+          docker pull -q $IMAGE_URL
+          echo "Pulling Finished"
+        
+          docker run -d --name idap --network none \
+            -v ./analysis:/home/workspace \
+            -w /opt/ida $IMAGE_URL \
+            tail -f /dev/null
+          
+          docker exec idap ./idat -A -L"/dev/stdout" \
+            -S"/home/workspace/dump/ida_with_struct_py3_cli.py /home/workspace/dump/script.json /home/workspace/dump/il2cpp.h" \
+            /home/workspace/${BINARY_NAME}.i64 | tee -a ./analysis/output.log
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: il2cpp_analysis
+          path: ./analysis
+      
+      # - name: Setup tmate session
+      #   uses: mxschmitt/action-tmate@v3
+      #   with:
+      #     limit-access-to-actor: false
+      
