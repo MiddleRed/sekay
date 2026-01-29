@@ -1,0 +1,267 @@
+name: Fetch IPA Package
+
+on: 
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App Version'
+        required: true
+        type: string
+      download_url:
+        description: 'Direct Download URL'
+        required: false
+        type: string
+        default: ''
+      enable_vnc:
+        description: 'Enable VNC'
+        required: false
+        default: false
+        type: boolean
+      update_version:
+        required: false
+        default: false
+        type: boolean
+
+  workflow_call:
+    inputs:
+      app_version:
+        required: true
+        type: string
+      download_url:
+        required: false
+        type: string
+        default: ''
+      enable_vnc:
+        required: false
+        default: false
+        type: boolean
+      update_version:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      flow_skip:
+        value: ${{ jobs.scrape.outputs.flow_skip }}
+      app_version:
+        value: ${{ jobs.scrape.outputs.app_version }}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: write
+
+    container:
+      image: ubuntu:22.04
+      options: --privileged --shm-size=2gb
+
+    steps:
+      - name: Install Base Tools
+        run: |
+          apt-get update
+          apt-get install -y wget curl git net-tools unzip xz-utils p7zip-full
+          
+          (type -p wget >/dev/null || (apt update && apt install wget -y)) \
+          && mkdir -p -m 755 /etc/apt/keyrings \
+          && out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          && cat $out | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+          && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+          && mkdir -p -m 755 /etc/apt/sources.list.d \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && apt update \
+          && apt install gh -y
+
+      - name: Install Scraper Environment
+        if: ${{ inputs.download_url == '' }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get install -y wget curl git net-tools unzip xz-utils libgbm1 libnss3 libasound2 python3-pip
+          
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          apt-get install -y ./google-chrome-stable_current_amd64.deb
+          rm google-chrome-stable_current_amd64.deb
+          apt-get install -y fonts-liberation fonts-noto-color-emoji fontconfig ttf-mscorefonts-installer
+          apt-get install -y xvfb x11vnc python3 pulseaudio dbus-x11 xfce4 xfce4-goodies xfce4-terminal
+          echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
+          fc-cache -f -v
+          
+          pip3 install playwright cbor2 #tf-playwright-stealth 
+          playwright install-deps chromium
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: work_repo
+          
+      - name: Setup User
+        run: |
+          useradd -m -s /bin/bash appuser
+          echo "appuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+          su appuser -c "mkdir -p /home/appuser/Downloads /home/appuser/Desktop"
+
+      - name: Start XFCE Desktop
+        if: ${{ inputs.download_url == '' }}
+        run: |
+          service dbus start || true
+          cat <<EOF > /home/appuser/run_desktop.sh
+          #!/bin/bash
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1440x900x24 &
+          sleep 2
+          export XFCE_PANEL_MIGRATE_DEFAULT=true
+          startxfce4 &
+          EOF
+          chmod +x /home/appuser/run_desktop.sh
+          su appuser -c "/home/appuser/run_desktop.sh"
+
+      - name: Setup noVNC & Tunnel
+        if: ${{ inputs.enable_vnc == true && inputs.download_url == '' }}
+        run: |
+          git clone https://github.com/novnc/noVNC.git /opt/noVNC
+          git clone https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+          ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
+          pip3 install numpy
+          cat <<EOF > /home/appuser/run_novnc.sh
+          #!/bin/bash
+          x11vnc -display :99 -forever -bg -noxdamage
+          /opt/noVNC/utils/novnc_proxy --vnc localhost:5900 --listen 6080 &
+          EOF
+          chmod +x /home/appuser/run_novnc.sh
+          su appuser -c "/home/appuser/run_novnc.sh"
+          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          dpkg -i cloudflared.deb
+          cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+          sleep 5
+          TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" tunnel.log | head -1)
+          echo "🔗 VNC Link: $TUNNEL_URL/vnc.html?autoconnect=true"
+
+      - name: Download IPA
+        env:
+          TARGET_APP_VERSION: ${{ inputs.app_version }}
+          DOWNLOAD_URL: ${{ inputs.download_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DOWNLOAD_DIR="/home/appuser/Downloads"
+          
+          if [ -n "$DOWNLOAD_URL" ]; then
+            echo "🎯 [Direct Mode] Downloading via wget..."
+            su appuser -c "wget -q --show-progress -O $DOWNLOAD_DIR/application.ipa '$DOWNLOAD_URL'"
+            exit 0
+          fi
+
+          git config --global --add safe.directory '*'
+          export GH_REPO="${{ github.repository }}"
+
+          cp ./work_repo/scripts/pw_scrape.py /home/appuser/
+          
+          cat <<EOF > /home/appuser/run_bot.sh
+          #!/bin/bash
+          export DISPLAY=:99
+          export HOME=/home/appuser
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+
+          python3 -u /home/appuser/pw_scrape.py || {
+            echo "⚠️ Python Script run failed, will cancel workflow..."
+            echo "flow_skip=true" >> "$GITHUB_ENV"
+
+            if command -v gh &> /dev/null; then
+              cd ./work_repo    
+              gh run cancel ${{ github.run_id }} 
+              sleep 15
+            fi
+            
+            exit 0
+          }
+          EOF
+          
+          echo "🤖 Script running..."
+          chown appuser:appuser /home/appuser/pw_scrape.py
+          chmod +x /home/appuser/pw_scrape.py
+
+          touch /home/appuser/bot.log
+          chmod 666 /home/appuser/bot.log
+          chmod +x /home/appuser/run_bot.sh
+          
+          su appuser -c "/home/appuser/run_bot.sh"
+
+      - name: Monitor & Verify Download
+        timeout-minutes: 10
+        env:
+          TARGET_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          TARGET_DIR="/home/appuser/Downloads"
+          while true; do
+            FILE=$(find "$TARGET_DIR" -name "*.ipa" -print -quit)
+            if [ -n "$FILE" ]; then
+              if [ ! -f "${FILE}.crdownload" ]; then
+                SIZE_MB=$(du -m "$FILE" | cut -f1)
+                echo "✅ Success: $(basename "$FILE") ($SIZE_MB MB)"
+                7z t "$FILE" || echo "Warning: 7z check failed, file might be corrupted"
+                break
+              fi
+            fi
+            echo "Waiting for download..."
+            sleep 5
+          done
+
+          mv $FILE ${TARGET_DIR}/${TARGET_APP_VERSION}.ipa
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application.ipa
+          path: /home/appuser/Downloads/*.ipa
+
+      - name: Update Version Info
+        if: inputs.update_version
+        env: 
+          APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          cd ./work_repo
+          LOCAL_VER=$(cat ios_version 2>/dev/null || echo "0.0.0")
+          if [ "$APP_VERSION" != "$LOCAL_VER" ]; then
+            echo "$APP_VERSION" > ios_version
+            echo "VERSION_UPDATED=true" >> "$GITHUB_ENV"
+            echo "app_version=$APP_VERSION" >> "$GITHUB_ENV"
+            echo "COMMIT_MESSAGE=Update iOS version to $APP_VERSION" >> "$GITHUB_ENV"
+            echo $COMMIT_MESSAGE
+          else
+            echo "flow_skip=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit Changes
+        if: env.VERSION_UPDATED == 'true'
+        uses: iarekylew00t/verified-bot-commit@v2
+        with:
+          workspace: work_repo
+          message: ${{ env.COMMIT_MESSAGE }}
+          files: ios_version
+        
+    outputs:
+      flow_skip: ${{ env.flow_skip }}
+      app_version: ${{ env.app_version || inputs.app_version }}
+
+  initial_release:
+    runs-on: ubuntu-latest
+    needs: [scrape]
+    if: needs.scrape.result == 'success' && inputs.update_version && needs.scrape.outputs.flow_skip != 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application.ipa
+          path: artifact
+      
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ needs.scrape.outputs.app_version }} iOS"
+          tag_name: "v${{ needs.scrape.outputs.app_version }}_ios"
+          files: artifact/*
+          overwrite_files: true

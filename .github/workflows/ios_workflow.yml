@@ -1,0 +1,132 @@
+name: iOS Package Workflow
+on:
+  repository_dispatch:
+    types: [ios-fetch]
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App Version'
+        required: true
+        type: string
+      download_url:
+        required: false
+        type: string
+        default: ''
+      enable_vnc:
+        required: false
+        default: false
+        type: boolean
+      run_analyze:
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  uni_env:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.combiner.outputs.app_version }}
+      enable_vnc: ${{ steps.combiner.outputs.enable_vnc }}
+      run_analyze: ${{ steps.combiner.outputs.run_analyze }}
+      download_url: ${{ steps.combiner.outputs.download_url }}
+    steps:
+      - id: combiner
+        run: |
+          VERSION="${{ github.event.inputs.app_version || github.event.client_payload.app_version }}"
+          VNC="${{ github.event.inputs.enable_vnc || github.event.client_payload.enable_vnc || 'false' }}"
+          ANALYZE="${{ github.event.inputs.run_analyze || github.event.client_payload.run_analyze || 'true' }}"
+          DOWNLOAD_URL="${{ github.event.inputs.download_url || github.event.client_payload.download_url || '' }}"
+          
+          echo "app_version=$VERSION" >> $GITHUB_OUTPUT
+          echo "enable_vnc=$VNC" >> $GITHUB_OUTPUT
+          echo "run_analyze=$ANALYZE" >> $GITHUB_OUTPUT
+          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+
+  get-package:
+    needs: uni_env
+    permissions:
+      actions: write
+      contents: write
+    uses: ./.github/workflows/chrome_pw.yml
+    with:
+      app_version: ${{ needs.uni_env.outputs.app_version }}
+      enable_vnc: ${{ needs.uni_env.outputs.enable_vnc == 'true' }}
+      update_version: true
+      download_url: ${{ needs.uni_env.outputs.download_url }}
+  
+  inital-analysis:
+    needs: [uni_env, get-package]
+    if: |
+      needs.uni_env.outputs.run_analyze == 'true' && 
+      needs.get-package.outputs.flow_skip != 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/analyze.yml
+    secrets: inherit
+    with:
+      artifact_name: application.ipa
+      binary_name: UnityFramework
+  
+  il2cpp-dumper:
+    needs: [uni_env, inital-analysis]
+    if: needs.uni_env.outputs.run_analyze == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/il2cppdumper.yml
+    secrets: inherit
+    with:
+      artifact_name: initial_analysis
+      binary_name: UnityFramework
+  
+  analysis-release:
+    runs-on: ubuntu-latest
+    needs: [uni_env, get-package, inital-analysis, il2cpp-dumper]
+    permissions:
+      contents: write
+    
+    steps:    
+      - name: Download ipa artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application.ipa
+          path: release
+      
+      - name: Download initial analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: initial_analysis
+          path: initial_analysis
+      
+      - name: Download il2cpp analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: il2cpp_analysis
+          path: il2cpp_analysis
+
+      - name: Prepare for release
+        env:
+          APP_VERSION: ${{ needs.get-package.outputs.app_version }}
+        run: |
+          PLATFORM="ios"
+          TITLE="iOS"
+
+          VERSION=$APP_VERSION
+          RELEASE_TAG="v${VERSION}_${PLATFORM}"
+          RELEASE_TITLE="${VERSION} ${TITLE}"
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_ENV
+          echo "RELEASE_TITLE=$RELEASE_TITLE" >> $GITHUB_ENV
+
+          (cd initial_analysis && zip -r ../release/initial_analysis.zip .)
+          (cd il2cpp_analysis && zip -r ../release/il2cpp_analysis.zip .)
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_TITLE }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: release/*  
+
+          overwrite_files: true
+          make_latest: false
+          fail_on_unmatched_files: false
